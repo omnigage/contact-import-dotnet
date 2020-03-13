@@ -5,9 +5,10 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
-using System.Net.Http.Headers;
+
 
 namespace omnigage_imports
 {
@@ -83,10 +84,10 @@ namespace omnigage_imports
                 using (var clientS3 = new HttpClient())
                 {
                     // Create multipart form including setting form data and file content
-                    MultipartFormDataContent form = await createMultipartForm(clientS3, uploadResponse, filePath, fileName, mimeType);
+                    MultipartFormDataContent form = await createMultipartForm(uploadResponse, filePath, fileName, mimeType);
 
                     // Upload to S3
-                    await postS3Request(clientS3, form, requestUrl);
+                    await postS3Request(clientS3, uploadResponse, form, requestUrl);
 
                     // Create import
                     string importContent = createImportContactSchema(uploadId);
@@ -108,8 +109,19 @@ namespace omnigage_imports
             return JObject.Parse(uploadResponse);
         }
 
-        static async Task postS3Request(HttpClient client, MultipartFormDataContent form, string url)
+        static async Task postS3Request(HttpClient client, JObject uploadInstance, MultipartFormDataContent form, string url)
         {
+            object[] requestHeaders = uploadInstance.SelectToken("data.attributes.request-headers").Select(s => (object)s).ToArray();
+
+            // Set each of the `upload` instance headers
+            foreach (JObject header in requestHeaders)
+            {
+                foreach (KeyValuePair<string, JToken> prop in header)
+                {
+                    client.DefaultRequestHeaders.Add(prop.Key, (string)prop.Value);
+                }
+            }
+
             // Make S3 request
             var responseS3 = await client.PostAsync(url, form);
             string responseContent = await responseS3.Content.ReadAsStringAsync();
@@ -133,20 +145,10 @@ namespace omnigage_imports
             return JObject.Parse(importResponse);
         }
 
-        static async Task<MultipartFormDataContent> createMultipartForm(HttpClient client, JObject uploadInstance, string filePath, string fileName, string mimeType)
+        static async Task<MultipartFormDataContent> createMultipartForm(JObject uploadInstance, string filePath, string fileName, string mimeType)
         {
             // Retrieve values to use for uploading to S3
-            object[] requestHeaders = uploadInstance.SelectToken("data.attributes.request-headers").Select(s => (object)s).ToArray();
             object[] requestFormData = uploadInstance.SelectToken("data.attributes.request-form-data").Select(s => (object)s).ToArray();
-
-            // Set each of the `upload` instance headers
-            foreach (JObject header in requestHeaders)
-            {
-                foreach (KeyValuePair<string, JToken> prop in header)
-                {
-                    client.DefaultRequestHeaders.Add(prop.Key, (string)prop.Value);
-                }
-            }
 
             var form = new MultipartFormDataContent("Upload----" + DateTime.Now.ToString(CultureInfo.InvariantCulture));
 
