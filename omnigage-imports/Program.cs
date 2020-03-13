@@ -29,8 +29,14 @@ namespace omnigage_imports
             // API host path, only change if using sandbox
             var host = "https://api.omnigage.io/api/v1/";
 
-            Task.Run(() => MainAsync(tokenKey, tokenSecret, accountKey, filePath, host));
-            Console.ReadLine();
+            try
+            {
+                MainAsync(tokenKey, tokenSecret, accountKey, filePath, host).Wait();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex.Message);
+            }
         }
 
         static async Task MainAsync(string tokenKey, string tokenSecret, string accountKey, string filePath, string host)
@@ -42,129 +48,180 @@ namespace omnigage_imports
             }
 
             // Build basic authorization
-            var authBytes = System.Text.Encoding.UTF8.GetBytes($"{tokenKey}:{tokenSecret}");
-            var authEncoded = System.Convert.ToBase64String(authBytes);
+            var authorization = createAuthorization(tokenKey, tokenSecret);
 
             // Collect meta on the file
             var fileName = Path.GetFileName(filePath);
             long fileSize = new System.IO.FileInfo(filePath).Length;
-            string extension = Path.GetExtension(fileName);
-            string mimeType = null;
+            string mimeType = getMimeType(fileName);
 
-            // Determine MIME type
-            if (extension == ".xlsx")
-            {
-                mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-            }
-            else if (extension == ".csv")
-            {
-                mimeType = "text/csv";
-            }
-            else
+            // Ensure proper MIME type
+            if (mimeType == null)
             {
                 throw new System.InvalidOperationException("Only CSV or XLSX files accepted.");
             }
 
-            Console.WriteLine($"File name: {fileName}");
-            Console.WriteLine($"File type: {mimeType}");
-            Console.WriteLine($"File size: {fileSize}");
+            Console.WriteLine($"File: {fileName}");
 
             using (var client = new HttpClient())
             {
                 // Set request context for Omnigage API
                 client.BaseAddress = new Uri(host);
-                client.DefaultRequestHeaders.Add("Authorization", "Basic " + authEncoded);
+                client.DefaultRequestHeaders.Add("Authorization", "Basic " + authorization);
                 client.DefaultRequestHeaders.Add("X-Account-Key", accountKey);
 
-                // Build `upload` instance payload
-                string uploadContent = @"{
-                   'name': '" + fileName + @"',
-                   'type': '" + mimeType + @"',
-                   'size': "  + fileSize + @"
-                }";
+                // Build `upload` instance payload and make request
+                string uploadContent = createUploadSchema(fileName, mimeType, fileSize);
+                JObject uploadResponse = await postUploadRequest(client, uploadContent);
 
-                var uploadPayload = new StringContent(uploadContent, Encoding.UTF8, "application/json");
-
-                var uploadRequest = await client.PostAsync("uploads", uploadPayload);
-                string uploadResponse = await uploadRequest.Content.ReadAsStringAsync();
-                JObject uploadInstance = JObject.Parse(uploadResponse);
-
-                // Retrieve values to use for uploading to S3
-                string requestUrl = (string) uploadInstance.SelectToken("data.attributes.request-url");
-                string uploadId = (string)uploadInstance.SelectToken("data.id");
-                object[] requestHeaders = uploadInstance.SelectToken("data.attributes.request-headers").Select(s => (object)s).ToArray();
-                object[] requestFormData = uploadInstance.SelectToken("data.attributes.request-form-data").Select(s => (object)s).ToArray();
+                // Extract upload ID and request URL
+                string uploadId = (string)uploadResponse.SelectToken("data.id");
+                string requestUrl = (string)uploadResponse.SelectToken("data.attributes.request-url");
 
                 Console.WriteLine($"Upload ID: {uploadId}");
 
                 using (var clientS3 = new HttpClient())
                 {
-                    // Set each of the `upload` instance headers
-                    foreach (JObject header in requestHeaders)
-                    {
-                        foreach (KeyValuePair<string, JToken> prop in header)
-                        {
-                            clientS3.DefaultRequestHeaders.Add(prop.Key, (string) prop.Value);
-                        }
-                    }
+                    // Create multipart form including setting form data and file content
+                    MultipartFormDataContent form = await createMultipartForm(clientS3, uploadResponse, filePath, fileName, mimeType);
 
-                    var form = new MultipartFormDataContent("Upload----" + DateTime.Now.ToString(CultureInfo.InvariantCulture));
+                    // Upload to S3
+                    await postS3Request(clientS3, form, requestUrl);
 
-                    // Set each of the `upload` instance form data
-                    foreach (JObject formData in requestFormData)
-                    {
-                        foreach (KeyValuePair<string, JToken> prop in formData)
-                        {
-                            form.Add(new StringContent((string) prop.Value), prop.Key);
-                        }
-                    }
+                    // Create import
+                    string importContent = createImportContactSchema(uploadId);
+                    JObject importResponse = await postImportContactRequest(client, importContent);
 
-                    // Set the content type (required by presigned URL)
-                    form.Add(new StringContent(mimeType), "Content-Type");
+                    // Extract import id
+                    string importId = (string)importResponse.SelectToken("data.id");
 
-                    // Add file content to form
-                    using var fileContent = new ByteArrayContent(await File.ReadAllBytesAsync(filePath));
-                    fileContent.Headers.ContentType = MediaTypeHeaderValue.Parse("multipart/form-data");
-                    form.Add(fileContent, "file", fileName);
+                    Console.WriteLine($"Import ID: {importId}");
+                };
+            };
+        }
 
-                    // Make S3 request
-                    var responseS3 = await clientS3.PostAsync(requestUrl, form);
-                    string responseContent = await responseS3.Content.ReadAsStringAsync();
-                    if ((int)responseS3.StatusCode == 204)
-                    {
-                        Console.WriteLine("Successfully uploaded file.");
-                    }
-                    else
-                    {
-                        Console.WriteLine(responseS3);
-                    }
-                }
+        static async Task<JObject> postUploadRequest(HttpClient client, string content)
+        {
+            var uploadPayload = new StringContent(content, Encoding.UTF8, "application/json");
+            var uploadRequest = await client.PostAsync("uploads", uploadPayload);
+            string uploadResponse = await uploadRequest.Content.ReadAsStringAsync();
+            return JObject.Parse(uploadResponse);
+        }
 
-                string importContent = @"{
-                   ""data"":{
-                      ""attributes"":{
-                         ""status"":""queued"",
-                         ""unique-primary-phone"":true
-                      },
-                      ""relationships"":{
-                         ""upload"":{
-                            ""data"":{
-                               ""type"":""uploads"",
-                               ""id"":""" + uploadId + @"""
-                            }
-                         }
-                      },
-                      ""type"":""import-contacts""
-                   }
-                }";
+        static async Task postS3Request(HttpClient client, MultipartFormDataContent form, string url)
+        {
+            // Make S3 request
+            var responseS3 = await client.PostAsync(url, form);
+            string responseContent = await responseS3.Content.ReadAsStringAsync();
 
-                var importPayload = new StringContent(importContent, Encoding.UTF8, "application/json");
-                var importRequest = await client.PostAsync("import-contacts", importPayload);
-                string importResponse = await importRequest.Content.ReadAsStringAsync();
-                JObject importInstance = JObject.Parse(importResponse);
-                string importId = (string)importInstance.SelectToken("data.id");
-                Console.WriteLine($"Import ID: {importId}");
+            if ((int)responseS3.StatusCode == 204)
+            {
+                Console.WriteLine("Successfully uploaded file.");
+            }
+            else
+            {
+                Console.WriteLine(responseS3);
+                throw new S3UploadFailed();
             }
         }
+
+        static async Task<JObject> postImportContactRequest(HttpClient client, string content)
+        {
+            var importPayload = new StringContent(content, Encoding.UTF8, "application/json");
+            var importRequest = await client.PostAsync("import-contacts", importPayload);
+            string importResponse = await importRequest.Content.ReadAsStringAsync();
+            return JObject.Parse(importResponse);
+        }
+
+        static async Task<MultipartFormDataContent> createMultipartForm(HttpClient client, JObject uploadInstance, string filePath, string fileName, string mimeType)
+        {
+            // Retrieve values to use for uploading to S3
+            object[] requestHeaders = uploadInstance.SelectToken("data.attributes.request-headers").Select(s => (object)s).ToArray();
+            object[] requestFormData = uploadInstance.SelectToken("data.attributes.request-form-data").Select(s => (object)s).ToArray();
+
+            // Set each of the `upload` instance headers
+            foreach (JObject header in requestHeaders)
+            {
+                foreach (KeyValuePair<string, JToken> prop in header)
+                {
+                    client.DefaultRequestHeaders.Add(prop.Key, (string)prop.Value);
+                }
+            }
+
+            var form = new MultipartFormDataContent("Upload----" + DateTime.Now.ToString(CultureInfo.InvariantCulture));
+
+            // Set each of the `upload` instance form data
+            foreach (JObject formData in requestFormData)
+            {
+                foreach (KeyValuePair<string, JToken> prop in formData)
+                {
+                    form.Add(new StringContent((string)prop.Value), prop.Key);
+                }
+            }
+
+            // Set the content type (required by presigned URL)
+            form.Add(new StringContent(mimeType), "Content-Type");
+
+            // Add file content to form
+            var fileContent = new ByteArrayContent(await File.ReadAllBytesAsync(filePath));
+            fileContent.Headers.ContentType = MediaTypeHeaderValue.Parse("multipart/form-data");
+            form.Add(fileContent, "file", fileName);
+
+            return form;
+        }
+
+        static string getMimeType(string fileName)
+        {
+            string extension = Path.GetExtension(fileName);
+
+            if (extension == ".xlsx")
+            {
+                return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+            }
+            else if (extension == ".csv")
+            {
+                return "text/csv";
+            }
+
+            return null;
+        }
+
+        static string createUploadSchema(string fileName, string mimeType, long fileSize)
+        {
+            return @"{
+                'name': '" + fileName + @"',
+                'type': '" + mimeType + @"',
+                'size': " + fileSize + @"
+            }";
+        }
+
+        static string createImportContactSchema(string uploadId)
+        {
+            return @"{
+                ""data"":{
+                    ""attributes"":{
+                        ""status"":""queued"",
+                        ""unique-primary-phone"":true
+                    },
+                    ""relationships"":{
+                        ""upload"":{
+                        ""data"":{
+                                ""type"":""uploads"",
+                                ""id"":""" + uploadId + @"""
+                            }
+                        }
+                    },
+                    ""type"":""import-contacts""
+                }
+            }";
+        }
+
+        static string createAuthorization(string key, string secret)
+        {
+            var authBytes = System.Text.Encoding.UTF8.GetBytes($"{key}:{secret}");
+            return System.Convert.ToBase64String(authBytes);
+        }
+
+        public class S3UploadFailed : System.Exception {}
     }
 }
