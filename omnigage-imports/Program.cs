@@ -48,9 +48,6 @@ namespace omnigage_imports
                 throw new FileNotFoundException($"File {filePath} not found.");
             }
 
-            // Build basic authorization
-            var authorization = createAuthorization(tokenKey, tokenSecret);
-
             // Collect meta on the file
             var fileName = Path.GetFileName(filePath);
             long fileSize = new System.IO.FileInfo(filePath).Length;
@@ -66,6 +63,9 @@ namespace omnigage_imports
 
             using (var client = new HttpClient())
             {
+                // Build basic authorization
+                var authorization = createAuthorization(tokenKey, tokenSecret);
+
                 // Set request context for Omnigage API
                 client.BaseAddress = new Uri(host);
                 client.DefaultRequestHeaders.Add("Authorization", "Basic " + authorization);
