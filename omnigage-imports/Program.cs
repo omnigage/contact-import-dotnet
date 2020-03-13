@@ -17,18 +17,18 @@ namespace omnigage_imports
         static void Main(string[] args)
         {
             // Set token retrieved from Account -> Developer -> API Tokens
-            var tokenKey = "";
-            var tokenSecret = "";
+            string tokenKey = "";
+            string tokenSecret = "";
 
             // Retrieve from Account -> Settings -> General -> "Key" field
-            var accountKey = "";
+            string accountKey = "";
 
             // Local path to a XLSX or CSV
             // On Mac, for example: "/Users/Shared/import-example.xlsx"
-            var filePath = "";
+            string filePath = "";
 
             // API host path, only change if using sandbox
-            var host = "https://api.omnigage.io/api/v1/";
+            string host = "https://api.omnigage.io/api/v1/";
 
             try
             {
@@ -40,6 +40,15 @@ namespace omnigage_imports
             }
         }
 
+        /// <summary>
+        /// Import contacts into an Omnigage account. Providing Omnigage authentication token, an account key,
+        /// file path to a CSV or XLSX, and host, this task will upload the file and create a contact import.
+        /// </summary>
+        /// <param name="tokenKey"></param>
+        /// <param name="tokenSecret"></param>
+        /// <param name="accountKey"></param>
+        /// <param name="filePath"></param>
+        /// <param name="host"></param>
         static async Task MainAsync(string tokenKey, string tokenSecret, string accountKey, string filePath, string host)
         {
             // Check that the file exists
@@ -49,7 +58,7 @@ namespace omnigage_imports
             }
 
             // Collect meta on the file
-            var fileName = Path.GetFileName(filePath);
+            string fileName = Path.GetFileName(filePath);
             long fileSize = new System.IO.FileInfo(filePath).Length;
             string mimeType = getMimeType(fileName);
 
@@ -64,7 +73,7 @@ namespace omnigage_imports
             using (var client = new HttpClient())
             {
                 // Build basic authorization
-                var authorization = createAuthorization(tokenKey, tokenSecret);
+                string authorization = createAuthorization(tokenKey, tokenSecret);
 
                 // Set request context for Omnigage API
                 client.BaseAddress = new Uri(host);
@@ -73,7 +82,7 @@ namespace omnigage_imports
 
                 // Build `upload` instance payload and make request
                 string uploadContent = createUploadSchema(fileName, mimeType, fileSize);
-                JObject uploadResponse = await postUploadRequest(client, uploadContent);
+                JObject uploadResponse = await postRequest(client, "uploads", uploadContent);
 
                 // Extract upload ID and request URL
                 string uploadId = (string)uploadResponse.SelectToken("data.id");
@@ -91,7 +100,7 @@ namespace omnigage_imports
 
                     // Create import
                     string importContent = createImportContactSchema(uploadId);
-                    JObject importResponse = await postImportContactRequest(client, importContent);
+                    JObject importResponse = await postRequest(client, "import-contacts", importContent);
 
                     // Extract import id
                     string importId = (string)importResponse.SelectToken("data.id");
@@ -101,14 +110,28 @@ namespace omnigage_imports
             };
         }
 
-        static async Task<JObject> postUploadRequest(HttpClient client, string content)
+        /// <summary>
+        /// Create a POST request to the Omnigage API and return an object for retrieving tokens
+        /// </summary>
+        /// <param name="client"></param>
+        /// <param name="uri"></param>
+        /// <param name="content"></param>
+        /// <returns>JObject</returns>
+        static async Task<JObject> postRequest(HttpClient client, string uri, string content)
         {
-            var uploadPayload = new StringContent(content, Encoding.UTF8, "application/json");
-            var uploadRequest = await client.PostAsync("uploads", uploadPayload);
-            string uploadResponse = await uploadRequest.Content.ReadAsStringAsync();
-            return JObject.Parse(uploadResponse);
+            StringContent payload = new StringContent(content, Encoding.UTF8, "application/json");
+            HttpResponseMessage request = await client.PostAsync(uri, payload);
+            string response = await request.Content.ReadAsStringAsync();
+            return JObject.Parse(response);
         }
 
+        /// <summary>
+        /// Make a POST request to S3 using presigned headers and multipart form
+        /// </summary>
+        /// <param name="client"></param>
+        /// <param name="uploadInstance"></param>
+        /// <param name="form"></param>
+        /// <param name="url"></param>
         static async Task postS3Request(HttpClient client, JObject uploadInstance, MultipartFormDataContent form, string url)
         {
             object[] requestHeaders = uploadInstance.SelectToken("data.attributes.request-headers").Select(s => (object)s).ToArray();
@@ -123,7 +146,7 @@ namespace omnigage_imports
             }
 
             // Make S3 request
-            var responseS3 = await client.PostAsync(url, form);
+            HttpResponseMessage responseS3 = await client.PostAsync(url, form);
             string responseContent = await responseS3.Content.ReadAsStringAsync();
 
             if ((int)responseS3.StatusCode == 204)
@@ -137,20 +160,20 @@ namespace omnigage_imports
             }
         }
 
-        static async Task<JObject> postImportContactRequest(HttpClient client, string content)
-        {
-            var importPayload = new StringContent(content, Encoding.UTF8, "application/json");
-            var importRequest = await client.PostAsync("import-contacts", importPayload);
-            string importResponse = await importRequest.Content.ReadAsStringAsync();
-            return JObject.Parse(importResponse);
-        }
-
+        /// <summary>
+        /// Create a multipart form using form data from the Omnigage `upload` instance along with the specified file path.
+        /// </summary>
+        /// <param name="uploadInstance"></param>
+        /// <param name="filePath"></param>
+        /// <param name="fileName"></param>
+        /// <param name="mimeType"></param>
+        /// <returns>A multipart form</returns>
         static async Task<MultipartFormDataContent> createMultipartForm(JObject uploadInstance, string filePath, string fileName, string mimeType)
         {
             // Retrieve values to use for uploading to S3
             object[] requestFormData = uploadInstance.SelectToken("data.attributes.request-form-data").Select(s => (object)s).ToArray();
 
-            var form = new MultipartFormDataContent("Upload----" + DateTime.Now.ToString(CultureInfo.InvariantCulture));
+            MultipartFormDataContent form = new MultipartFormDataContent("Upload----" + DateTime.Now.ToString(CultureInfo.InvariantCulture));
 
             // Set each of the `upload` instance form data
             foreach (JObject formData in requestFormData)
@@ -165,13 +188,18 @@ namespace omnigage_imports
             form.Add(new StringContent(mimeType), "Content-Type");
 
             // Add file content to form
-            var fileContent = new ByteArrayContent(await File.ReadAllBytesAsync(filePath));
+            ByteArrayContent fileContent = new ByteArrayContent(await File.ReadAllBytesAsync(filePath));
             fileContent.Headers.ContentType = MediaTypeHeaderValue.Parse("multipart/form-data");
             form.Add(fileContent, "file", fileName);
 
             return form;
         }
 
+        /// <summary>
+        /// Determine MIME type based on the file name.
+        /// </summary>
+        /// <param name="fileName"></param>
+        /// <returns>MIME type</returns>
         static string getMimeType(string fileName)
         {
             string extension = Path.GetExtension(fileName);
@@ -188,6 +216,13 @@ namespace omnigage_imports
             return null;
         }
 
+        /// <summary>
+        /// Create Omnigage `uploads` schema
+        /// </summary>
+        /// <param name="fileName"></param>
+        /// <param name="mimeType"></param>
+        /// <param name="fileSize"></param>
+        /// <returns>JSON</returns>
         static string createUploadSchema(string fileName, string mimeType, long fileSize)
         {
             return @"{
@@ -197,6 +232,11 @@ namespace omnigage_imports
             }";
         }
 
+        /// <summary>
+        /// Create Omnigage `import-contacts` schema
+        /// </summary>
+        /// <param name="uploadId"></param>
+        /// <returns>JSON</returns>
         static string createImportContactSchema(string uploadId)
         {
             return @"{
@@ -218,12 +258,21 @@ namespace omnigage_imports
             }";
         }
 
+        /// <summary>
+        /// Create Authorization token following RFC 2617 
+        /// </summary>
+        /// <param name="key"></param>
+        /// <param name="secret"></param>
+        /// <returns>Base64 encoded string</returns>
         static string createAuthorization(string key, string secret)
         {
-            var authBytes = System.Text.Encoding.UTF8.GetBytes($"{key}:{secret}");
+            byte[] authBytes = System.Text.Encoding.UTF8.GetBytes($"{key}:{secret}");
             return System.Convert.ToBase64String(authBytes);
         }
 
+        /// <summary>
+        /// S3 Upload Failed exception
+        /// </summary>
         public class S3UploadFailed : System.Exception {}
     }
 }
